@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
@@ -27,6 +28,36 @@ class SolveOutcome:
     status_name: str  # OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN
     assignments: list[list[int]] | None = None
     objective: int | None = None
+
+
+class BudgetExhausted(Exception):
+    """同一请求内的共用求解预算已耗尽。"""
+
+
+@dataclass
+class Budget:
+    """一次请求内多次求解共用的墙钟预算。
+
+    每次求解前从剩余预算里切一段作为该次求解的时限；预算耗尽后不再发起求解，
+    由调用方按“待核”处理。
+    """
+
+    total_seconds: float = 10.0
+    started: float = field(default_factory=time.perf_counter)
+
+    def remaining(self) -> float:
+        return max(0.0, self.total_seconds - (time.perf_counter() - self.started))
+
+    def request_seconds(self) -> float:
+        """为下一次求解分配时限。
+
+        CP-SAT 到点后还要做收尾（实测可超出 0.1~0.6 秒），因此预留 1 秒，
+        保证整次请求的墙钟时间仍落在预算内；剩余不足 1 毫秒时视为耗尽。
+        """
+        remaining = self.remaining() - 1.0
+        if remaining <= 1e-3:
+            raise BudgetExhausted
+        return remaining
 
 
 @dataclass
@@ -148,8 +179,17 @@ class RosterCpSolver:
         *,
         use_official_totals: bool = True,
         shared_seconds_lower_bound: int | None = None,
+        exclude_reference: list[list[int]] | None = None,
+        fixed_lineups: dict[int, list[int]] | None = None,
+        hint_lineups: list[list[int]] | None = None,
     ) -> tuple[cp_model.CpModel, dict, dict, dict]:
-        """构建基础模型，返回 model 与变量字典。"""
+        """构建基础模型，返回 model 与变量字典。
+
+        exclude_reference：给定一套完整逐段名单，要求新解至少在某个片段上与之不同。
+        用于判定“名单是否唯一”：若加入该约束后不可行，则参考名单是唯一解。
+        fixed_lineups：把指定片段（0 起下标）的在场名单完全钉死。
+        hint_lineups：给求解器的初始提示（完整逐段名单）。
+        """
         model = cp_model.CpModel()
         P = len(self.players)
 
@@ -166,6 +206,19 @@ class RosterCpSolver:
         for t in range(self.T):
             for pi in self.confirmed_idx[t]:
                 model.add(x[t, pi] == 1)
+
+        # 钉死指定片段的完整名单
+        if fixed_lineups:
+            for t, lineup in fixed_lineups.items():
+                on = set(lineup)
+                for pi, p in enumerate(self.players):
+                    model.add(x[t, pi] == (1 if p in on else 0))
+
+        if hint_lineups is not None:
+            for t in range(self.T):
+                on = set(hint_lineups[t])
+                for pi, p in enumerate(self.players):
+                    model.add_hint(x[t, pi], 1 if p in on else 0)
 
         # 官方累计秒数
         if use_official_totals:
@@ -208,6 +261,16 @@ class RosterCpSolver:
                 >= shared_seconds_lower_bound
             )
 
+        # 排除某套参考名单：至少一个片段与其不同。
+        # 直接写成一条 no-good 子句（字面量即 x 或其否定），比引入 diff 变量快得多。
+        if exclude_reference is not None:
+            literals = []
+            for t in range(self.T):
+                on = set(exclude_reference[t])
+                for pi, p in enumerate(self.players):
+                    literals.append(x[t, pi].Not() if p in on else x[t, pi])
+            model.add_bool_or(literals)
+
         return model, x, b, z
 
     def _solve(
@@ -216,9 +279,14 @@ class RosterCpSolver:
         objective_var: cp_model.IntVar | None,
         maximize: bool = True,
         x: dict[tuple[int, int], cp_model.IntVar] | None = None,
+        *,
+        budget: Budget | None = None,
     ) -> SolveOutcome:
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = SOLVER_TIME_LIMIT_SECONDS
+        if budget is None:
+            solver.parameters.max_time_in_seconds = SOLVER_TIME_LIMIT_SECONDS
+        else:
+            solver.parameters.max_time_in_seconds = budget.request_seconds()
         solver.parameters.num_workers = 8
         if objective_var is not None:
             if maximize:
@@ -255,12 +323,72 @@ class RosterCpSolver:
     # 对外的分阶段求解
     # ------------------------------------------------------------------ #
     def feasible(
-        self, *, shared_seconds_lower_bound: int | None = None
+        self,
+        *,
+        shared_seconds_lower_bound: int | None = None,
+        budget: Budget | None = None,
+        fixed_lineups: dict[int, list[int]] | None = None,
+        hint_lineups: list[list[int]] | None = None,
     ) -> SolveOutcome:
         model, x, _, _ = self._build_base_model(
-            shared_seconds_lower_bound=shared_seconds_lower_bound
+            shared_seconds_lower_bound=shared_seconds_lower_bound,
+            fixed_lineups=fixed_lineups,
+            hint_lineups=hint_lineups,
         )
-        return self._solve(model, None, x=x)
+        return self._solve(model, None, x=x, budget=budget)
+
+    def has_alternative(
+        self,
+        reference: list[list[int]],
+        *,
+        budget: Budget | None = None,
+        fixed_lineups: dict[int, list[int]] | None = None,
+        hint_lineups: list[list[int]] | None = None,
+    ) -> SolveOutcome:
+        """判断在 reference 之外是否还存在另一套完整名单。
+
+        INFEASIBLE 表示 reference 是唯一解；FEASIBLE 表示至少还有第二套。
+        """
+        model, x, _, _ = self._build_base_model(
+            exclude_reference=reference,
+            fixed_lineups=fixed_lineups,
+            hint_lineups=hint_lineups,
+        )
+        return self._solve(model, None, x=x, budget=budget)
+
+    def find_alternatives(
+        self,
+        reference: list[list[int]],
+        *,
+        budget: Budget | None = None,
+        fixed_lineups: dict[int, list[int]] | None = None,
+        hint_lineups: list[list[int]] | None = None,
+        max_count: int = 3,
+    ) -> tuple[list[list[list[int]]], str]:
+        """一次建模、多次求解，最多收集 max_count 套与 reference 不同的名单。
+
+        返回 (名单列表, 最后一次求解状态)。若状态为 INFEASIBLE 且列表为空，
+        说明 reference 是唯一解。中途求解 UNKNOWN 时，剩余结果不可作为唯一性证据。
+        """
+        model, x, _, _ = self._build_base_model(
+            exclude_reference=reference,
+            fixed_lineups=fixed_lineups,
+            hint_lineups=hint_lineups,
+        )
+        found: list[list[list[int]]] = []
+        while len(found) < max_count:
+            outcome = self._solve(model, None, x=x, budget=budget)
+            if outcome.status_name not in ("OPTIMAL", "FEASIBLE"):
+                return found, outcome.status_name
+            assert outcome.assignments is not None
+            found.append(outcome.assignments)
+            literals = []
+            for t in range(self.T):
+                on = set(outcome.assignments[t])
+                for pi, p in enumerate(self.players):
+                    literals.append(x[t, pi].Not() if p in on else x[t, pi])
+            model.add_bool_or(literals)
+        return found, "OPTIMAL"
 
     def optimize_shared(self, maximize: bool) -> SolveOutcome:
         model, x, _, z = self._build_base_model()

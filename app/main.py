@@ -6,15 +6,20 @@ import time
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
+from .evidence import build_pack, recompute_pack
 from .schemas import (
     CheckResponse,
+    EvidencePack,
+    EvidencePackBuildResponse,
+    EvidencePackRequest,
+    EvidenceRecomputeResponse,
     HealthResponse,
+    NetBounds,
     RosterCheckRequest,
     SegmentAssignment,
     WitnessRoster,
-    NetBounds,
 )
-from .solver import RosterCpSolver, SolveOutcome
+from .solver import Budget, RosterCpSolver, SolveOutcome
 from .verifier import (
     actual_substitution_counts,
     compute_net_points,
@@ -33,7 +38,11 @@ app = FastAPI(
         "- `guaranteed`（必定达标）：所有可行名单的同场秒数都达到阈值；\n"
         "- `possible`（可能达标）：存在达标名单，也存在不达标名单；\n"
         "- `impossible`（无法达标）：记录本身可行，但没有任何名单达标；\n"
-        "- `infeasible_record`（原始记录冲突）：约束无法同时成立，只给冲突，不给达标结论。"
+        "- `infeasible_record`（原始记录冲突）：约束无法同时成立，只给冲突，不给达标结论。\n\n"
+        "证据包接口（档案员少留录像、接收方复算整节名单）：\n"
+        "- `POST /api/v1/evidence/pack`：从可留存片段里选出最少的一组，"
+        "使整节名单可唯一复算；\n"
+        "- `POST /api/v1/evidence/recompute`：只提交证据包，证实名单唯一才返回完整名单。"
     ),
     version="1.0.0",
 )
@@ -338,3 +347,123 @@ def check_roster(
 @app.get("/health", response_model=HealthResponse, tags=["system"])
 def health() -> HealthResponse:
     return HealthResponse(service="roster-check-api")
+
+
+# --------------------------------------------------------------------------- #
+# 证据包：档案员打包 / 接收方复算
+# --------------------------------------------------------------------------- #
+_EVIDENCE_DEMO_REQUEST = {
+    "players": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "official_seconds": {
+        "1": 600, "2": 600, "3": 600,
+        "4": 200, "5": 200, "6": 200,
+        "7": 200, "8": 200, "9": 200,
+    },
+    "segments": [
+        {"duration_seconds": 200, "players_substituted": 0},
+        {"duration_seconds": 200, "players_substituted": 2},
+        {"duration_seconds": 200, "players_substituted": 2},
+    ],
+    "manual_lineup": [
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 6, 7],
+        [1, 2, 3, 8, 9],
+    ],
+    "retainable_clips": [1, 2, 3],
+}
+
+
+@app.post(
+    "/api/v1/evidence/pack",
+    response_model=EvidencePackBuildResponse,
+    summary="档案员打包：选出最少可留存片段，使整节名单可唯一复算",
+)
+def pack_evidence(
+    req: EvidencePackRequest = Body(
+        ...,
+        openapi_examples={
+            "packable_demo": {
+                "summary": "可唯一复算：3 段中只需保留 2 段名单",
+                "description": (
+                    "9 人、3 段各 200 秒；球员 1~3 打满全场，其余 6 人各只打一段。"
+                    "第 2、3 段各换下 2 人，且相邻两段在场名单完全不相交。"
+                    "整节名单归结为把 6 名轮换球员分成 3 对并分配到 3 段，共 90 套；"
+                    "保留任意 2 段即可锁定第 3 段，故最少片段数为 2，"
+                    "接口按片段号字典序选出 [1,2]。"
+                ),
+                "value": _EVIDENCE_DEMO_REQUEST,
+            },
+            "ambiguous_demo": {
+                "summary": "可留存片段不足：全部用上仍多解，返回合规备选名单",
+                "description": (
+                    "同一记录，但只允许保留第 1 段。固定第 1 段后仍有 6 套名单，"
+                    "接口返回 insufficient_evidence，并给出一套与人工名单不同、"
+                    "完全符合技术台记录的备选名单及其差异片段。"
+                ),
+                "value": {
+                    **_EVIDENCE_DEMO_REQUEST,
+                    "retainable_clips": [1],
+                },
+            },
+        },
+    )
+) -> EvidencePackBuildResponse:
+    return build_pack(req, Budget(total_seconds=10.0))
+
+
+_EVIDENCE_DEMO_PACK = {
+    "format_version": "1.0",
+    "players": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "official_seconds": {
+        "1": 600, "2": 600, "3": 600,
+        "4": 200, "5": 200, "6": 200,
+        "7": 200, "8": 200, "9": 200,
+    },
+    "segments": [
+        {"segment_index": 1, "duration_seconds": 200, "players_substituted": 0},
+        {"segment_index": 2, "duration_seconds": 200, "players_substituted": 2},
+        {"segment_index": 3, "duration_seconds": 200, "players_substituted": 2},
+    ],
+}
+
+
+@app.post(
+    "/api/v1/evidence/recompute",
+    response_model=EvidenceRecomputeResponse,
+    summary="接收方复算：仅凭证据包证实整节名单是否唯一",
+)
+def recompute_evidence(
+    pack: EvidencePack = Body(
+        ...,
+        openapi_examples={
+            "unique_demo": {
+                "summary": "名单唯一：返回完整逐段名单",
+                "description": (
+                    "保留第 1、2 段完整名单；6 名轮换球员中已有 4 人被锁定，"
+                    "第 3 段必为剩余 2 人，整节名单唯一，接口返回 roster。"
+                ),
+                "value": {
+                    **_EVIDENCE_DEMO_PACK,
+                    "revealed_clips": [
+                        {"segment_index": 1, "players_on_court": [1, 2, 3, 4, 5]},
+                        {"segment_index": 2, "players_on_court": [1, 2, 3, 6, 7]},
+                    ],
+                },
+            },
+            "multiple_demo": {
+                "summary": "名单不唯一：提示补证，不返回完整名单",
+                "description": (
+                    "只保留第 1 段名单，第 2、3 段仍有 6 种分法；"
+                    "接口返回 multiple_solutions、建议补证片段，且 roster 为 null。"
+                ),
+                "value": {
+                    **_EVIDENCE_DEMO_PACK,
+                    "revealed_clips": [
+                        {"segment_index": 1, "players_on_court": [1, 2, 3, 4, 5]},
+                    ],
+                },
+            },
+        },
+    )
+) -> EvidenceRecomputeResponse:
+    return recompute_pack(pack, Budget(total_seconds=10.0))
